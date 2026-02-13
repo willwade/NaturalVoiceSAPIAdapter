@@ -2,7 +2,7 @@ name: MSBuild
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "**" ]
     tags: ["v[0-9]**"]
   pull_request:
     branches: [ "master" ]
@@ -18,9 +18,37 @@ env:
   BUILD_CONFIGURATION: Release
 
 jobs:
+  build-sherpa-config:
+    name: Build SherpaOnnxConfig
+    runs-on: windows-latest
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Build SherpaOnnxConfig (self-contained, x64)
+      run: dotnet publish SherpaOnnxConfig\SherpaOnnxConfig.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o ${{github.workspace}}\sherpa-config
+
+    - name: Verify Sherpa integration checks
+      shell: pwsh
+      run: |
+        .\scripts\verify-sherpa-integration.ps1 -SkipBuild
+
+    - name: Upload SherpaOnnxConfig artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: sherpa-onnx-config
+        path: |
+          sherpa-config/SherpaOnnxConfig.exe
+          sherpa-config/merged_models.json
+
   build-utilities:
     name: Build submodules
     runs-on: windows-latest
+    needs: build-sherpa-config
 
     permissions:
       contents: read
@@ -74,6 +102,13 @@ jobs:
         nuget restore Installer -SolutionDirectory .
         msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{matrix.platform}} /p:OutDir=${{github.workspace}}\out\ Installer
 
+    - name: Download SherpaOnnxConfig and copy to utilities output
+      if: matrix.platform == 'x86' || matrix.platform == 'x64'
+      uses: actions/download-artifact@v4
+      with:
+        name: sherpa-onnx-config
+        path: ${{github.workspace}}\out\
+
     - name: Upload artifact
       uses: actions/upload-artifact@v6
       with:
@@ -95,6 +130,13 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v6
 
+    - name: Download SherpaOnnx dependencies
+      shell: pwsh
+      run: |
+        $platform = "${{matrix.platform}}"
+        if ($platform -eq "x86") { $platform = "x86" }
+        .\download-sherpa-deps.ps1 -Platforms $platform
+
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
@@ -104,7 +146,14 @@ jobs:
 
     - name: Build
       working-directory: ${{github.workspace}}
-      run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{matrix.platform}} /p:OutDir=${{github.workspace}}\out\ . /t:NaturalVoiceSAPIAdapter
+      run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{matrix.platform}} /p:OutDir=${{github.workspace}}\out\ /p:RegisterOutput=false . /t:NaturalVoiceSAPIAdapter
+
+    - name: Compile Sherpa smoke test (x64)
+      if: matrix.platform == 'x64'
+      shell: pwsh
+      working-directory: ${{github.workspace}}
+      run: |
+        .\scripts\run-sherpa-smoke-test.ps1 -CompileOnly
       
     - name: Remove unnecessary DLLs
       # Remove the codec DLL because it can trigger the 'GStreamer DLL not found' error
@@ -118,6 +167,8 @@ jobs:
         $dlls = & $dumpbinpath /dependents NaturalVoiceSAPIAdapter.dll Microsoft.CognitiveServices.*.dll `
           | ? { $_ -like "    *.dll" } | % { $_.Trim() } | Select-Object -Unique
         $dlls += "NaturalVoiceSAPIAdapter.dll", "Microsoft.CognitiveServices.*.dll"
+        # Keep SherpaOnnx runtime dependencies in release artifacts.
+        $dlls += "sherpa-onnx-c-api.dll", "onnxruntime.dll", "onnxruntime_providers_shared.dll"
         Remove-Item * -Include *.dll -Exclude $dlls
         Remove-Item Microsoft.CognitiveServices.Speech.extension.codec.dll -ErrorAction Ignore
         exit 0   # This is necessary because "-ErrorAction Ignore" doesn't ensure a zero exit code
@@ -142,8 +193,10 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [build-utilities, build-main]
-    if: github.ref_type == 'tag'
+    needs: [build-sherpa-config, build-utilities, build-main]
+    # TEMPORARY: Disabled tag check for testing release ZIP creation
+    # REVERT BEFORE MERGE: Uncomment the line below to only create releases on tags
+    # if: github.ref_type == 'tag'
 
     permissions:
       contents: write
@@ -168,17 +221,27 @@ jobs:
         mkdir x64
         mv utilities-x64/* x64/
         mv main-x64/* x64/
-        zip -r NaturalVoiceSAPIAdapter_${ver}_x86_x64.zip x86 x64 Installer.exe -i "*.exe" "*.dll"
+        zip -r NaturalVoiceSAPIAdapter_${ver}_x86_x64.zip x86 x64 Installer.exe -i "*.exe" "*.dll" "*.json"
         mkdir ARM64
         mv utilities-ARM64/* ARM64/
         mv main-ARM64/* ARM64/
-        zip -r NaturalVoiceSAPIAdapter_${ver}_ARM64.zip x86 x64 ARM64 Installer.exe -i "*.exe" "*.dll"
+        zip -r NaturalVoiceSAPIAdapter_${ver}_ARM64.zip x86 x64 ARM64 Installer.exe -i "*.exe" "*.dll" "*.json"
         zip -r debug_symbols.zip x86 x64 ARM64 -i "*.pdb"
 
     - name: Create release
+      # TEMPORARY: Disabled for testing - ZIPs will be available as artifacts only
+      # REVERT BEFORE MERGE: Uncomment the uses: line below to create GitHub releases
+      if: false
       uses: softprops/action-gh-release@v2
       with:
         body_path: ${{github.workspace}}/release_notes.md
         files: |
           ${{github.workspace}}/artifacts/*.zip
-      
+
+    # TEMPORARY: Upload ZIPs as artifacts for testing
+    # REVERT BEFORE MERGE: Remove this step when re-enabling GitHub releases
+    - name: Upload release ZIPs as artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-zips
+        path: ${{github.workspace}}/artifacts/*.zip

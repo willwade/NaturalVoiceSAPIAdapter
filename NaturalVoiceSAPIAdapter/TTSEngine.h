@@ -10,6 +10,7 @@
 #include "SapiException.h"
 #include "Mp3Decoder.h"
 
+#include "../SherpaOnnx/SherpaOnnxEngine.h"
 #include "NaturalVoiceSAPIAdapter_i.h"
 
 
@@ -121,13 +122,16 @@ private: // Member variables
 	CComPtr<ISpPhoneConverter> m_phoneConverter;
 	std::shared_ptr<SpeechSynthesizer> m_synthesizer;
 	std::unique_ptr<SpeechRestAPI> m_restApi;
+	std::shared_ptr<SherpaOnnx::Engine> m_sherpaOnnx;
 	std::future<void> m_lastCancellingFuture;
 
 	ErrorMode m_errorMode = ErrorMode::ProbeForError;
 	bool m_isEdgeVoice = false;
+	bool m_isSherpaOnnxVoice = false;
 	bool m_onlineDelayOptimization = false;
 	bool m_compensatedSilenceWritten = false;
 	std::atomic_bool m_synthesizerStarted = false;
+	std::atomic_bool m_sherpaAbortRequested = false;
 	ULONG m_lastSilentBytes = 0;
 	ULONG m_compensatedSilentBytes = 0;
 	DWORD m_lastSpeakCompletedTicks = 0;
@@ -162,6 +166,7 @@ private: // Private methods
 	void InitPhoneConverter();
 	void InitVoice();
 	bool InitLocalVoice(ISpDataKey* pConfigKey);
+	bool InitSherpaOnnxVoice(ISpDataKey* pConfigKey);
 	bool InitCloudVoiceSynthesizer(ISpDataKey* pConfigKey);
 	bool InitCloudVoiceRestAPI(ISpDataKey* pConfigKey);
 	void SetupSynthesizerEvents(ULONGLONG interests);
@@ -172,6 +177,8 @@ private: // Private methods
 	void AppendPhonemesToSsml(const SPPHONEID* pPhoneIds);
 	void AppendSAPIContextToSsml(const SPVCONTEXT& context);
 	bool BuildSSML(const SPVTEXTFRAG* pTextFragList);
+	std::wstring StripSSML(const std::wstring& ssml);
+	void GenerateSherpaOnnxAudio(const std::string& plainText);
 
 	void FinishSimulatingBookmarkEvents(ULONGLONG streamOffset);
 
@@ -230,6 +237,8 @@ HRESULT CTTSEngine::OnException(
 		auto& cat = ex.code().category();
 		if (cat == std::system_category() || cat == asio::system_category())
 			return HRESULT_FROM_WIN32(ex.code().value());
+		else if (cat == sapi_category())
+			return static_cast<HRESULT>(ex.code().value());
 		else if (cat == azac_category())
 			return ex.code().value() == AZAC_ERR_INVALID_ARG ? E_INVALIDARG : E_FAIL;
 		return E_FAIL;

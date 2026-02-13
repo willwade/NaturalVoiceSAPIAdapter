@@ -13,6 +13,10 @@
 #include "SapiException.h"
 #include "Logger.h"
 
+// SherpaOnnx support
+#include "../SherpaOnnx/SherpaOnnxModels.h"
+#include "../SherpaOnnx/SherpaOnnxConfig.h"
+
 
 // CVoiceTokenEnumerator
 
@@ -197,6 +201,15 @@ HRESULT CVoiceTokenEnumerator::FinalConstruct() noexcept
 
             for (auto& token : onlineTokens)
                 s_cachedTokens.push_back(std::move(token.second));
+
+            // Enumerate SherpaOnnx offline voices (similar to narrator voices - local models)
+            TokenMap sherpaTokens;
+            if (!key.GetDword(L"NoSherpaVoices"))
+            {
+                EnumSherpaVoices(sherpaTokens, langFlags, languages);
+                for (auto& token : sherpaTokens)
+                    s_cachedTokens.push_back(std::move(token.second));
+            }
         }
 
         if (!s_isCacheTaskScheduled)
@@ -648,6 +661,182 @@ static std::shared_ptr<DataKeyData> MakeAzureVoiceToken(
     });
 }
 
+// Create a SAPI voice token for a SherpaOnnx model
+static std::shared_ptr<DataKeyData> MakeSherpaVoiceToken(
+    const SherpaOnnx::VoiceInfo& model)
+{
+    auto deriveKokoroLang = [](std::wstring locale) -> std::wstring
+    {
+        if (locale.empty())
+            return L"en-us";
+
+        size_t delim = locale.find_first_of(L",; ");
+        if (delim != std::wstring::npos)
+            locale = locale.substr(0, delim);
+
+        std::replace(locale.begin(), locale.end(), L'_', L'-');
+        std::transform(locale.begin(), locale.end(), locale.begin(), ::towlower);
+        return locale.empty() ? L"en-us" : locale;
+    };
+
+    // Convert language from model (e.g., "en-US", "zh-CN")
+    std::wstring language = UTF8ToWString(model.language);
+
+    // Create a friendly display name
+    std::wstring displayName = UTF8ToWString(model.displayName);
+    if (displayName.empty())
+    {
+        // Fallback to model name if display name is empty
+        displayName = UTF8ToWString(model.name);
+        // Capitalize first letter
+        if (!displayName.empty())
+        {
+            displayName[0] = towupper(displayName[0]);
+        }
+    }
+
+    // Add model type prefix to display name
+    std::wstring typePrefix;
+    switch (model.modelType) {
+        case SherpaOnnx::ModelType::Matcha:
+            typePrefix = L"Matcha ";
+            break;
+        case SherpaOnnx::ModelType::Kokoro:
+            typePrefix = L"Kokoro ";
+            break;
+        case SherpaOnnx::ModelType::Piper:
+            typePrefix = L"Piper ";
+            break;
+        case SherpaOnnx::ModelType::MMS:
+            typePrefix = L"MMS ";
+            break;
+        case SherpaOnnx::ModelType::Vits:
+        default:
+            typePrefix = L"VITS ";
+            break;
+    }
+
+    std::wstring friendlyName = L"Sherpa " + typePrefix + displayName;
+
+    // Create registry key name: Sherpa-model-name
+    std::wstring regName = L"Sherpa-" + UTF8ToWString(model.name);
+
+    // Parse language for SAPI (e.g., "en-US" -> "0409")
+    std::wstring languageIds = LanguageIDsFromLocaleName(language);
+    if (languageIds.empty())
+    {
+        // Fallback: try the primary language subtag as a neutral locale and build
+        // the language + fallback chain dynamically via LangUtils.
+        std::wstring langCode = language;
+        size_t dashPos = language.find(L'-');
+        if (dashPos != std::wstring::npos)
+            langCode = language.substr(0, dashPos);
+
+        LANGID langid = LangIDFromLocaleName(langCode.c_str());
+        if (langid != 0 && langid != LOCALE_CUSTOM_UNSPECIFIED)
+        {
+            languageIds = LangIDToHexLang(langid);
+            for (LANGID fallback : GetLangIDFallbacks(langid))
+            {
+                languageIds += L';';
+                languageIds += LangIDToHexLang(fallback);
+            }
+        }
+
+        if (languageIds.empty())
+        {
+            LogWarn("Skipping Sherpa model '{}' due to unknown locale '{}'", model.name, model.language);
+            return {};
+        }
+    }
+
+    // Determine gender from voice name if possible. Use Neutral unless there is a strong hint.
+    std::wstring gender = L"Neutral";
+    std::wstring nameLower = UTF8ToWString(model.name);
+    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+    if (nameLower.find(L"female") != std::wstring::npos ||
+        nameLower.find(L"woman") != std::wstring::npos ||
+        nameLower.find(L"girl") != std::wstring::npos)
+    {
+        gender = L"Female";
+    }
+    else if (nameLower.find(L"male") != std::wstring::npos ||
+        nameLower.find(L"man") != std::wstring::npos ||
+        nameLower.find(L"boy") != std::wstring::npos)
+    {
+        gender = L"Male";
+    }
+
+    // Build config values based on model type
+    std::vector<std::pair<std::wstring, std::wstring>> configValues = {
+        { L"EngineType", L"Sherpa" },
+        { L"SherpaOnnxModelType", std::to_wstring(static_cast<int>(model.modelType)) },
+        { L"SampleRate", std::to_wstring(model.sampleRate) },
+        { L"SpeakerCount", std::to_wstring(model.speakerCount) },
+        { L"IsSherpaVoice", L"1" }
+    };
+
+    // Add model-type-specific paths
+    switch (model.modelType) {
+        case SherpaOnnx::ModelType::Matcha:
+            configValues.push_back({ L"SherpaOnnxAcousticModel", UTF8ToWString(model.acousticModelPath) });
+            configValues.push_back({ L"SherpaOnnxVocoder", UTF8ToWString(model.vocoderPath) });
+            configValues.push_back({ L"SherpaOnnxTokens", UTF8ToWString(model.tokensPath) });
+            if (!model.dataDir.empty()) {
+                configValues.push_back({ L"SherpaOnnxDataDir", UTF8ToWString(model.dataDir) });
+            }
+            break;
+
+        case SherpaOnnx::ModelType::Kokoro:
+            configValues.push_back({ L"SherpaOnnxModelPath", UTF8ToWString(model.modelPath) });
+            configValues.push_back({ L"SherpaOnnxVoices", UTF8ToWString(model.voicesPath) });
+            configValues.push_back({ L"SherpaOnnxTokens", UTF8ToWString(model.tokensPath) });
+            configValues.push_back({ L"SherpaOnnxLang", deriveKokoroLang(language) });
+            if (!model.dataDir.empty()) {
+                configValues.push_back({ L"SherpaOnnxDataDir", UTF8ToWString(model.dataDir) });
+            }
+            break;
+
+        case SherpaOnnx::ModelType::Vits:
+        case SherpaOnnx::ModelType::Piper:
+        case SherpaOnnx::ModelType::MMS:
+        default:
+            configValues.push_back({ L"SherpaOnnxModelPath", UTF8ToWString(model.modelPath) });
+            configValues.push_back({ L"SherpaOnnxTokens", UTF8ToWString(model.tokensPath) });
+            if (!model.dataDir.empty()) {
+                configValues.push_back({ L"SherpaOnnxDataDir", UTF8ToWString(model.dataDir) });
+            }
+            break;
+    }
+
+    return std::shared_ptr<DataKeyData>(new DataKeyData {
+        .path = regName,
+        .values = {
+            { L"", std::move(friendlyName) },
+            { L"CLSID", L"{013AB33B-AD1A-401C-8BEE-F6E2B046A94E}" }
+        },
+        .subkeys = {
+            { L"Attributes", {
+                .path = regName + L"\\Attributes",
+                .values = {
+                    { L"Name", std::move(displayName) },
+                    { L"Gender", std::move(gender) },
+                    { L"Age", L"Adult" },
+                    { L"Language", std::move(languageIds) },
+                    { L"Locale", std::move(language) },
+                    { L"Vendor", L"K2FSA" },
+                    { L"NaturalVoiceType", L"Sherpa;Offline" },
+                    { L"SherpaModelName", UTF8ToWString(model.name) }
+                }
+            } },
+            { L"NaturalVoiceConfig", {
+                .path = regName + L"\\NaturalVoiceConfig",
+                .values = std::move(configValues)
+            } }
+        }
+    });
+}
+
 // Enumerate all language IDs of installed phoneme converters
 static std::set<LANGID> GetSupportedLanguageIDs()
 {
@@ -856,4 +1045,62 @@ void CVoiceTokenEnumerator::EnumAzureVoices(TokenMap& tokens, DWORD langFlags, c
         {
             return MakeAzureVoiceToken(json, key, region, errorMode);
         });
+}
+
+void CVoiceTokenEnumerator::EnumSherpaVoices(TokenMap& tokens, DWORD langFlags, const std::vector<std::wstring>& languages)
+{
+    try
+    {
+        // Get default model search paths
+        std::vector<std::wstring> searchPaths = SherpaOnnx::Models::GetDefaultModelPaths();
+
+        // Discover SherpaOnnx models
+        auto [models, errors] = SherpaOnnx::Models::DiscoverModelsWithErrors(searchPaths);
+
+        if (models.empty())
+        {
+            logger.debug("No SherpaOnnx models found");
+            for (const auto& err : errors)
+            {
+                logger.warn("Sherpa model scan issue [{}]: {}", err.modelName, err.message);
+            }
+            return;
+        }
+
+        logger.info("Found " + std::to_string(models.size()) + " SherpaOnnx models");
+        for (const auto& err : errors)
+        {
+            logger.warn("Sherpa model scan issue [{}]: {}", err.modelName, err.message);
+        }
+
+        // Process each discovered model
+        for (const auto& model : models)
+        {
+            std::wstring language = UTF8ToWString(model.language);
+
+            // Simple language filtering if specified
+            if (!(langFlags & Lang_AllLanguages))
+            {
+                if (!languages.empty() && !IsLanguageInList(language, languages))
+                    continue;
+            }
+
+            // Create the voice token
+            auto token = MakeSherpaVoiceToken(model);
+            if (token)
+            {
+                // Use model name as the key (unique identifier)
+                tokens[model.name] = std::move(token);
+                logger.debug("Added Sherpa voice: " + model.name);
+            }
+            else
+            {
+                logger.warn("Skipped Sherpa voice due to incomplete metadata: {}", model.name);
+            }
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        logger.error("Error enumerating Sherpa voices: " + std::string(ex.what()));
+    }
 }
